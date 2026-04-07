@@ -1,4 +1,4 @@
-model_first_conv = Chain(
+encoder = Chain(
         
         Conv((5, 5), 1 => 8, gelu; pad = 2),
         Conv((5, 5), 8 => 16, gelu; pad = 2),
@@ -8,11 +8,12 @@ model_first_conv = Chain(
             Conv((1, 1), 32 => 16),
         ), +),
     ) 
-#GroupNorm(64, 4),
-model_conv = Chain(
+
+
+model_inner = Chain(
         model_first_conv,
-        Conv((5, 5), 16 => 32, gelu; pad = 2),
-        Conv((5, 5), 32 => 64, gelu; pad = 2),
+        Conv((5, 5), 16 => 32; pad = 2),
+        Conv((5, 5), 32 => 64; pad = 2),
         SkipConnection(Chain(
             Conv((1, 1), 64 => 128, gelu),
             Conv((1, 1), 128 => 128, gelu),
@@ -22,6 +23,14 @@ model_conv = Chain(
         Conv((1, 1), 32 => 16),
     ) 
 
-model = NeuralODE(model_conv, (0.0f0, 1.0f0), Tsit5(); save_everystep = false,
+sdeq = NeuralODE(model_inner, (0.0f0, 1.0f0), Tsit5(); save_everystep = false,
     sensealg = BacksolveAdjoint(; autojacvec = ZygoteVJP()),
     reltol = 1e-5, abstol = 1e-6, save_start = false)
+
+
+
+model = Chain(
+    encoder,
+    sdeq,
+    readout,
+)
