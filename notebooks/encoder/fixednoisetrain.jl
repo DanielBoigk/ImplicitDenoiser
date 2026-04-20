@@ -24,11 +24,12 @@ dev = gdev
 
 include("model.jl")
 
-rng = Xoshiro(0)
-ps, st = Lux.setup(rng, model)
-
-#@load "ps0.0064887484_2026-01-07T20:46:50.892.jld2" ps
-#@load "st0.0064887484_2026-01-07T20:46:50.892.jld2" st
+rng = Xoshiro()
+#ps, st = Lux.setup(rng, model)
+#@load "ps0.023593083_2026-04-20T18:11:11.406.jld2" ps
+#@load "st0.023593083_2026-04-20T18:11:11.406.jld2" st
+@load "ps_latest.jld2" ps
+@load "st_latest.jld2" st
 #@load "st4.jld2" st
 #@load "ps4.jld2" ps
 
@@ -40,14 +41,15 @@ state = Optimisers.setup(opt,ps)
 train_state = Lux.Training.TrainState(model, ps, st, opt)
 
 function loss_function(model, ps, st, (x, y_true))
-    y_pred = model(x, ps, st)[1][1]
+    y, st = model(x, ps, st)
+    y_pred = y[1]
+    #y_pred = model(x, ps, st)[1][1]
     loss_mse= MSELoss()
     mse_loss = loss_mse(y_pred, y_true)
     #sptrl_loss = loss_mse(dct(dct(y_pred,1),2),dct(dct(y_pred,1),2))
     return mse_loss, st
     #return mes_loss + sptrl_loss, st
 end
-
 
 # This is to test the model if it works:
 #=
@@ -161,7 +163,9 @@ function train!(
         t = now()
 
         @save "ps$(avg_epoch_loss)_$t.jld2" ps
+        @save "ps_latest.jld2" ps
         @save "st$(avg_epoch_loss)_$t.jld2" st
+        @save "st_latest.jld2" st
         println(
             "=== Epoch finished | " *
             "avg loss = $(round(avg_epoch_loss; sigdigits=5)) | "*
