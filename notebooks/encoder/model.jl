@@ -1,6 +1,6 @@
 model_first_conv = Chain(
         
-        Conv((5, 5), 1 => 8, tanh; pad = 2),
+        Conv((5, 5), 1 => 8; pad = 2),
         Conv((5, 5), 8 => 16; pad = 2),
         SkipConnection(Chain(
             Conv((1, 1), 16 => 64, gelu),
@@ -12,7 +12,7 @@ model_first_conv = Chain(
 model_conv = Chain(
         model_first_conv,
         GroupNorm(16, 4),
-        Conv((5, 5), 16 => 32, tanh; pad = 2),
+        Conv((5, 5), 16 => 32; pad = 2),
         Conv((5, 5), 32 => 64; pad = 2),
         SkipConnection(Chain(
             Conv((1, 1), 64 => 128, gelu),
@@ -28,3 +28,23 @@ model_conv = Chain(
 #model = NeuralODE(model_conv, (0.0f0, 1.0f0), Tsit5(); save_everystep = false, sensealg = BacksolveAdjoint(; autojacvec = ZygoteVJP()), reltol = 1e-3, abstol = 1e-4, save_start = false)
 
 #model = SkipDeepEquilibriumNetwork(model_conv, Tsit5(); save_everystep = false, sensealg = BacksolveAdjoint(; autojacvec = ZygoteVJP()), reltol = 1e-5, abstol = 1e-6, save_start = false)
+
+#= 
+# Your setup
+t_base = 1.0f0
+r_dist = 0.5f0 # maximum extra time
+
+function train_step(target_x, noisy_x, ps, st)
+    # 1. Sample r for this specific batch
+    r = rand(Float32) * r_dist
+    tspan = (0.0f0, t_base + r)
+
+    # 2. Pass tspan directly into the model call
+    # Lux's NeuralODE implementation allows overriding tspan here
+    (pred, st_node), back = Pullback(noisy_x, ps, st) do x, p, s
+        model(x, p, s; tspan = tspan)
+    end
+    
+    # ... calculate loss and update ...
+end
+=#

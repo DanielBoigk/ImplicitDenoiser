@@ -15,7 +15,7 @@ Other considerations:
 - I'm unsure whether it is better to train with an encoder, or whether to enroll at any time.
 - No idea how to handle the boundary nodes. 
 - This network is easily made equivariant/invariant towards various affine transformations.
-- The training scheme didn't turn out to be that easy. Basically one needs to start with a NeuralODE and train as a denoiser for fixed noise levels, then one goes on with variable gaussian noise in a skip-DEQ. Further I have not pogressed. Maybe I need to edit the loss function to handle spectral noise. Once it can handle spectral noise also it should be usable as a prior for learning arbitrary image corruptions... That was the idea at least. 
+- The training scheme didn't turn out to be that easy. Basically one needs to start with a NeuralODE and train as a denoiser for fixed noise levels, then one goes on with variable gaussian noise in a DEQ. Further I have not pogressed. Maybe I need to edit the loss function to handle spectral noise. Once it can handle spectral noise also it should be usable as a prior for learning arbitrary image corruptions... That was the idea at least. 
 
 Some relevant papers:
 [Multiscale Deep Equilibrium Networks](https://arxiv.org/pdf/2006.08656)

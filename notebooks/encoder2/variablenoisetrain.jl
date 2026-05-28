@@ -2,7 +2,7 @@ using Pkg
 Pkg.activate("../../")
 Pkg.instantiate()
 
-im_path = "../../../Images/128/"
+im_path = "../../../Images/64/"
 
 using Lux, LuxCUDA, MLUtils
 using Optimisers, Random, Statistics
@@ -15,7 +15,6 @@ using ComponentArrays
 using DeepEquilibriumNetworks
 using Plots
 using Dates
-using SciMLSensitivity, Lux, NonlinearSolve, LinearSolve
 
 #Reactant.set_default_backend("cpu")
 #const device = reactant_device()
@@ -24,23 +23,25 @@ const gdev = gpu_device()
 dev = gdev
 
 include("model.jl")
-
 rng = Xoshiro()
+
+
+#model = NeuralODE(model_conv, (0.0f0, 1.0f0), Tsit5(); save_everystep = false, sensealg = BacksolveAdjoint(; autojacvec = ZygoteVJP()), reltol = 1e-3, abstol = 1e-4, save_start = false)
 #ps, st = Lux.setup(rng, model)
-ps , st = Lux.setup(rng, model)
+#ps = ps |> ComponentArray{Float32}|> dev  
 #@load "ps0.023593083_2026-04-20T18:11:11.406.jld2" ps
 #@load "st0.023593083_2026-04-20T18:11:11.406.jld2" st
-#@load "ps_latest.jld2" ps
-#@load "st_latest.jld2" st
+@load "ps_latestvn.jld2" ps
+@load "st_latestvn.jld2" st
 #@load "st4.jld2" st
 #@load "ps4.jld2" ps
 
 ps = ps |> ComponentArray |> dev
 st = st |> dev
 
-opt = Optimisers.NAdam(1e-4)
+opt = Optimisers.NAdam(1e-3)
 state = Optimisers.setup(opt,ps)
-train_state = Lux.Training.TrainState(model, ps, st, opt)
+#train_state = Lux.Training.TrainState(model, ps, st, opt)
 
 function loss_function(model, ps, st, (x, y_true))
     y, st = model(x, ps, st)
@@ -55,8 +56,8 @@ end
 
 # This is to test the model if it works:
 #=
-x = randn(Float32,128,128,1,4)
-y_true = randn(Float32,128,128,1,4)
+x = randn(T,128,128,1,4)
+y_true = randn(T,128,128,1,4)
 x_dev = x |> dev
 y_dev = y_true |> dev
 y, _ = model(x_dev, ps, st)
@@ -65,7 +66,7 @@ y, _ = model(x_dev, ps, st)
 function add_gaussian_noise(img, σ = 1e-3 )
     out = img .+ σ .* randn(eltype(img), size(img))
     if rand(Bool)
-        @. out = min(max(out, 0.0),1.0) 
+        @. out = min(max(out, 0.0), 1.0)
     end
     out
 end
@@ -82,9 +83,9 @@ end
 # reflection (horizontal mirror)
 reflect_spatial(K) = reverse(K, dims=2)
 
-function load_images_to_array(path,num,corrupt_func)
-    x = zeros(Float32,128,128,1,num)
-    y = zeros(Float32,128,128,1,num)
+function load_images_to_array(path, num, corrupt_func, size)
+    x = zeros(Float32,size,size,1,num)
+    y = zeros(Float32,size,size,1,num)
     for i in 1:num
         img = Float32.(load("$path$i.jpg"))
         # equivariant training:
@@ -104,68 +105,68 @@ function load_images_to_array(path,num,corrupt_func)
     return x,y
 end
 
-cfunc(img) = add_gaussian_noise(Float32.(img),2e-1)
+cfunc(img) = add_gaussian_noise(Float32.(img), abs(randn(Float32))*0.1f0 )
 
-function load_images(batchsize, path, num, corrupt_func)
-    x_img,y_img = load_images_to_array(path,num, corrupt_func)
+function load_images(batchsize, path, num, corrupt_func,size)
+    x_img,y_img = load_images_to_array(path,num, corrupt_func, size)
     DataLoader(mapobs(gdev, (x_img, y_img)); batchsize, shuffle = true)
 end
 
 
-#dataloader = load_images(64, im_path, 7000, cfunc)
-function inner_loop(tspan, ps, st, data, )
-    model = NeuralODE(model_conv, tspan, Tsit5(); save_everystep = false, sensealg = BacksolveAdjoint(; autojacvec = ZygoteVJP()), reltol = 1e-3, abstol = 1e-4, save_start = false)
+
+function inner_loop(model_conv, tspan, ps, st, data, state)
+    model = NeuralODE(model_conv, tspan, Tsit5(); save_everystep = false, sensealg = BacksolveAdjoint(; autojacvec = ZygoteVJP()), reltol = 1e-5, abstol = 1e-6, save_start = false)
+    #train_state = Lux.Training.TrainState(model, ps, st, opt)
+    #Training.single_train_step!(AutoZygote(), loss_function, (x_dev, y_dev), train_state)
     (loss, st), back = Zygote.pullback(ps -> loss_function(model, ps, st, data), ps)
     grads = back((one(loss), nothing))[1]
 
     state, ps = Optimisers.update(state, ps, grads)
+    return ps, st, state, loss
 end
 
+
 # 📚 Training Parameters (use the values you set previously)
-epochs = 5
+epochs = 1
 losses = Float32[]
 #num_batches = length(dataloader)
 #println("Starting Training for $epochs epochs...")
 
 
 function train!(
-    model_inner,
+    model,
     ps,
     st,
     opt,
     im_path;
+    epochs = 2,
     batchsize = 32,
     num_images = 7000,
     log_every = 10,
+    size = 128
 )
     state = Optimisers.setup(opt, ps)
     losses = Float32[]
-
-    println("Starting Training for 1 epoch...")
+    for epoch in 1:epochs
+    println("Starting Training for epoch $epoch ...")
 
         epoch_loss = 0.0f0
-        dataloader = load_images(batchsize, im_path, num_images, cfunc)
+        dataloader = dataloader = load_images(batchsize, im_path, num_images, cfunc, size)
         num_batches = length(dataloader)
 
         for (i, data) in enumerate(dataloader)
-            r = abs(randn())
-            tspan = (0.0f0, 1.0f0 + r) 
-            model = NeuralODE(model_conv, tspan, Tsit5(); save_everystep = false, sensealg = BacksolveAdjoint(; autojacvec = ZygoteVJP()), reltol = 1e-3, abstol = 1e-4, save_start = false)
-            (loss, st), back =
-                Zygote.pullback(ps -> loss_function(model, ps, st, data), ps)
-            grads = back((one(loss), nothing))[1]
-
-            state, ps = Optimisers.update(state, ps, grads)
-
+            r = 0.2f0 * abs(randn(Float32))
+            tspan = (0.0f0, 1.0f0 + r)
+            ps, st, state, loss = inner_loop(model, tspan, ps, st, data, state)
             epoch_loss += loss
             push!(losses, loss)
-            print("-")
+            print("| $i: Loss: $loss Depth: $r ")
             if i % log_every == 0
                 t = now()
                 print(
-                    "Batch $i/$num_batches | " *
+                    "\nBatch $i/$num_batches | " *
                     "Loss = $(round(loss; sigdigits=4))" *
-                    "Time: $t \n" 
+                    " Time: $t \n"
                 )
             end
         end
@@ -173,57 +174,26 @@ function train!(
         avg_epoch_loss = epoch_loss / num_batches
         t = now()
 
-        @save "ps$(avg_epoch_loss)_$t.jld2" ps
-        @save "ps_latest.jld2" ps
-        @save "st$(avg_epoch_loss)_$t.jld2" st
-        @save "st_latest.jld2" st
+        @save "snapshots/ps$(avg_epoch_loss)_$t.jld2" ps
+        @save "ps_latestvn.jld2" ps
+        @save "snapshots/st$(avg_epoch_loss)_$t.jld2" st
+        @save "st_latestvn.jld2" st
         println(
-            "=== Epoch finished | " *
+            "\n=== Epoch $epoch finished | " *
             "avg loss = $(round(avg_epoch_loss; sigdigits=5)) | "*
             " Time: $t" *
-            " ==="
+            " ===\n"
         )
-
+    end
     return ps, st, losses
 end
 
 ps, st, losses = train!(
-    model,
+    model_conv,
     ps,
     st,
     opt,
     im_path;
+    size = 64,
+    epochs = 2
 )
-
-#=
-# 🏁 Main Training Loop
-for epoch in 1:epochs
-    epoch_loss = 0.0f0
-    if epoch ≠ 1
-        dataloader = load_images(64, im_path, 7000, cfunc)
-    end
-        # Iterate over all batches
-    for (i, data) in enumerate(dataloader)
-        # Perform the training step
-        (loss, st), back = Zygote.pullback(ps -> loss_function(model, ps, st, data), ps)
-        grads = back((one(loss), nothing))[1]
-        state, ps = Optimisers.update(state, ps, grads)
-        train_state = Lux.Training.TrainState(model, ps, st, opt)
-        # Accumulate loss for the epoch
-        epoch_loss += loss
-        push!(losses, loss) # Store individual batch loss
-        print("-")
-        # Print progress
-        if i % 10 == 0 # Print every 10 batches
-            end_time = now()
-            print(" Epoch: $epoch/$epochs | Batch: $i/$num_batches | Loss: $loss | Time: $end_time \n")
-        end
-    end
-    end_time = now()
-    # Calculate and print average epoch loss
-    avg_epoch_loss = epoch_loss / num_batches
-    @save "ps$avg_epoch_loss:$end_time.jld2" ps
-    @save "st$avg_epoch_loss:$end_time.jld2" st
-    println("--- Epoch $epoch Finished! Average Loss: $avg_epoch_loss ---")
-end
-=#
