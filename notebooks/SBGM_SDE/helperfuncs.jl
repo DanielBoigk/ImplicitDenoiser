@@ -19,6 +19,7 @@ end
 β(t) = βmin + (βmax-βmin)*t/T
 ᾱ(t) = exp(-βmin*t - (βmax-βmin)/(2*T) * t^2)
 
+forward(x,t) = forward_sample(x,t,ᾱ)
 
 # rotate spatial dims (1,2) by 90° * k
 function rot90_spatial(K, k::Int)
@@ -32,10 +33,18 @@ end
 # reflection (horizontal mirror)
 reflect_spatial(K) = reverse(K, dims=2)
 
-#=
-function load_images_to_array(path, t, num, forward, size)
-    x = ones(Float32, size, size, 2, num)
-    y = zeros(Float32, size, size, 1, num)
+function sinusoidal_embedding(t::Float32, embedding_dim::Int, max_positions::Int=10000)
+    half_dim = embedding_dim ÷ 2
+    emb_scale = log(Float32(max_positions)) / (half_dim - 1)
+    emb = exp.(-emb_scale .* Float32.(0:half_dim-1))
+    emb = t .* emb  # shape: (half_dim,)
+    emb = vcat(sin.(emb), cos.(emb))  # shape: (embedding_dim,)
+    return Float32.(emb)
+end
+
+function load_images_to_array(path, t, num, forward, img_size, emb_size)
+    x = ones(Float32, img_size, img_size, 2+emb_size, num)
+    y = zeros(Float32, img_size, img_size, 1, num)
     for i in 1:num
         img = Float32.(load("$path$i.jpg"))
         
@@ -50,18 +59,15 @@ function load_images_to_array(path, t, num, forward, size)
         xt, ϵ = forward(img, t[i])
         x[:, :, 1, i] = xt
         
-        # FIX: Multiply and assign back to the second channel
-        x[:, :, 2, i] .*= t[i] 
-        
+        emb = reshape(sinusoidal_embedding(t[i], emb_size), (1,1,emb_size,1))
+        x[:, :, 3:end, i] .= emb
         y[:, :, 1, i] = ϵ
     end
     return x, y
 end
 
-function load_images(batchsize, path, num, forward,size,tmax=1)
+function load_images(batchsize, path, num, forward,img_size,emb_size,dev, tmax=1)
     t_array = tmax .* rand(Float32, num)
-    x_img,y_img = load_images_to_array(path,t_array,num, forward, size)
-    DataLoader(mapobs(gdev, (x_img, y_img)); batchsize, shuffle = true)
+    x_img,y_img = load_images_to_array(path,t_array,num, forward, img_size, emb_dim)
+    DataLoader(mapobs(dev, (x_img, y_img)); batchsize=batchsize, shuffle = true)
 end
-
-=#
