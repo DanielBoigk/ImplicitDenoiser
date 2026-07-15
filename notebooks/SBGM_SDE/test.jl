@@ -40,7 +40,7 @@ emb_dim = 32
 load_model = true
 test_model = false
 
-model= Chain(
+model = Chain(
     #Conv((17, 17), 2 => 256; pad = 8),
     first_conv,
     #last_conv,
