@@ -68,7 +68,7 @@ const xdev = reactant_device(; force=true)
 const cdev = cpu_device()
 dev = xdev
 rng = Xoshiro()
-opt = Optimisers.NAdam(1e-4)
+opt = Optimisers.NAdam(3.33e-5)
 
 
 if load_model
