@@ -8,7 +8,7 @@ using Dates, Plots, UnicodePlots
 include("loadImgnet.jl")   # defines `imgs` :: (64, 64, 100000) Float32, in [0, 1]
 include("../model.jl")     # defines the attention U-Net (see unet_tinyimagenet64)
 
-batch_size = 64
+batch_size = 128
 dim = 64
 
 # Width of the internal sinusoidal embedding of the noise level. This is now
@@ -250,7 +250,7 @@ end
 
 # Sanity check first — one (gently warmed-up) epoch to confirm the loss is
 # actually going down before committing to the full run:
-train_state = train_many_epochs!(train_state, 1)
+train_state = train_many_epochs!(train_state, 6)
 
 # Then the rest of the schedule:
 # train_state = train_many_epochs!(train_state, 149; start_epoch=2)
