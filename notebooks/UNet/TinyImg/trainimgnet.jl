@@ -1,6 +1,6 @@
 using Pkg
 Pkg.activate("../../../")
-using Lux, Reactant, Enzyme, MLUtils, NNlib
+using Lux, LuxCore, Reactant, Enzyme, MLUtils, NNlib
 using Optimisers, Random, Statistics, Images
 using LinearAlgebra, Images, JLD2, ComponentArrays
 using Dates, Plots, UnicodePlots
@@ -17,7 +17,7 @@ dim = 64
 # needs to match anything about the input tensor's channel count.
 emb_dim = 32
 
-load_model = false   # no checkpoint compatible with the U-Net exists yet
+load_model = true
 test_model = true
 
 model = unet_tinyimagenet64(; embedding_dims=emb_dim)
@@ -250,7 +250,7 @@ end
 
 # Sanity check first — one (gently warmed-up) epoch to confirm the loss is
 # actually going down before committing to the full run:
-train_state = train_many_epochs!(train_state, 6)
+#train_state = train_many_epochs!(train_state, 6)
 
 # Then the rest of the schedule:
-# train_state = train_many_epochs!(train_state, 149; start_epoch=2)
+train_state = train_many_epochs!(train_state, 150; start_epoch=1)
