@@ -5,242 +5,145 @@ using Optimisers, Random, Statistics, Images
 using LinearAlgebra, Images, JLD2, ComponentArrays
 using Dates, Plots, UnicodePlots
 
-include("loadImgnet.jl")
+include("loadImgnet.jl")   # defines `imgs` :: (64, 64, 100000) Float32, in [0, 1]
+include("../model.jl")     # defines LocalScoreNet (see local_score_net_64)
 
-batch_size = 64
-dim = 64 
+batch_size = 128
+dim = 64
 
-spatial_conv_layer = Conv((17, 17), 2 => 256; pad = 8)
-struct ConvFirstTwo{C}<: Lux.AbstractLuxWrapperLayer{:conv}
-    conv::C
-    length::Int
-end
-# 2. Explicitly define how state is generated
-function Lux.initialstates(rng::AbstractRNG, m::ConvFirstTwo)
-    return (conv = Lux.initialstates(rng, m.conv),)
-end
+# Width of the internal sinusoidal embedding of the diffusion time. Purely an
+# architectural hyperparameter of LocalScoreNet (embedded and FiLM-conditioned
+# internally) — it no longer needs to match anything about the input tensor's
+# channel count, since the image stays a single grayscale channel throughout.
+emb_dim = 64
 
-# 3. Explicitly define how parameters are generated
-function Lux.initialparameters(rng::AbstractRNG, m::ConvFirstTwo)
-    return (conv = Lux.initialparameters(rng, m.conv),)
-end
-function (m::ConvFirstTwo)(x, ps, st) 
-    # Use standard slicing that maps cleanly to XLA operations
-    x1 = x[:, :, 1:2, :]
-    x2 = x[:, :, 3:end, :] # 'end' is perfectly fine and statically resolved by XLA
-    y1, st_conv = m.conv(x1, ps.conv, st.conv)
-    return cat(y1, x2; dims=3), (conv = st_conv,)
-end
-
-first_conv = ConvFirstTwo(spatial_conv_layer, 34)
-
-emb_dim = 32
 load_model = true
-test_model = false
+test_model = true
 
-model= Chain(
-    #Conv((17, 17), 2 => 256; pad = 8),
-    first_conv,
-    #last_conv,
-    SkipConnection(
-        Chain(
-            Conv((1, 1), 256+emb_dim => 512, gelu),
-            SkipConnection(
-                Chain(
-                    Conv((1, 1), 512 => 512, gelu),
-                    Conv((1, 1), 512 => 512, gelu),
-                    Conv((1, 1), 512 => 512, gelu),
-                ),
-                +
-            ),
-            Conv((1, 1), 512 => 256, gelu),
-            Conv((1, 1), 256 => 256+emb_dim, gelu),
-        ),
-        +
-    ),
-    Conv((1, 1), 256+emb_dim => 128, gelu),
-    Conv((1, 1), 128 => 64, gelu),
-    Conv((1, 1), 64 => 1)
-)
-
+model = local_score_net_64(; embedding_dims=emb_dim)
 
 const xdev = reactant_device(; force=true)
 const cdev = cpu_device()
 dev = xdev
 rng = Xoshiro()
-opt = Optimisers.NAdam(3.33e-5)
+opt = Optimisers.OptimiserChain(Optimisers.ClipNorm(1.0f0), Optimisers.NAdam(2.0f-4))
 
-
-if load_model
-    @load "ps_latestvn.jld2" ps_cpu 
+if load_model && isfile("ps_latestvn.jld2") && isfile("st_latestvn.jld2")
+    @load "ps_latestvn.jld2" ps_cpu
     @load "st_latestvn.jld2" st_cpu
     ps = ps_cpu |> dev
     st = st_cpu |> dev
 else
-    ps, st = Lux.setup(rng, model)|> dev  
+    ps, st = Lux.setup(rng, model) |> dev
 end
-state = Optimisers.setup(opt,ps)
-
 
 train_state = Training.TrainState(model, ps, st, opt)
 
 train!(data, train_state) = Training.single_train_step!(
-                AutoEnzyme(),
-                MSELoss(),
-                data,
-                train_state;
-                return_gradients=Val(false),
-            )
+    AutoEnzyme(),
+    MSELoss(),
+    data,
+    train_state;
+    return_gradients=Val(false),
+)
 
 if test_model
-    x_trial = randn(Float32,dim,dim,2+emb_dim,batch_size) |> dev
-    y_trial = randn(Float32,dim,dim,1,batch_size) |> dev
-    data_trial = (x_trial,y_trial)
-    
-    model_compiled = @compile model(x_trial, ps, st)
-    y_pred, st = model_compiled(x_trial, ps, st)
+    # Model input is a (noisy_image, t) tuple, not a single concatenated
+    # tensor: the image keeps its 1 (grayscale) channel, and the per-sample
+    # scalar diffusion time is embedded internally by LocalScoreNet.
+    x_trial = randn(Float32, dim, dim, 1, batch_size) |> dev
+    t_trial = rand(Float32, batch_size) |> dev
+    y_trial = randn(Float32, dim, dim, 1, batch_size) |> dev
+    data_trial = ((x_trial, t_trial), y_trial)
+
+    model_compiled = @compile model((x_trial, t_trial), ps, st)
+    y_pred, st = model_compiled((x_trial, t_trial), ps, st)
     println("Model successfully compiled!")
     train!(data_trial, train_state)
     println("Train step successfully compiled!")
 end
 
+# Hyperparameters for the Variance Preserving (VP) SDE
 const βmin = 0.1
 const βmax = 20.0
 T = 1
 
 function normalize_image(img)
-    out= 2 .* (Float32.(img) .- 0.5)
-    return out
+    return 2 .* (Float32.(img) .- 0.5)
 end
 
 function denormalize_image(img)
-    out = (0.5 .* img) .+ 0.5
-    return out
+    return (0.5 .* img) .+ 0.5
 end
 
 function forward_sample(x0, t, ᾱ)
     αbar = ᾱ(t)
-    ε = randn(size(x0))
+    ε = randn(Float32, size(x0))
     xt = sqrt(αbar) .* x0 .+ sqrt(1 - αbar) .* ε
     return xt, ε
 end
 
+β(t) = βmin + (βmax - βmin) * t / T
+ᾱ(t) = exp(-βmin * t - (βmax - βmin) / (2 * T) * t^2)
 
-β(t) = βmin + (βmax-βmin)*t/T
-ᾱ(t) = exp(-βmin*t - (βmax-βmin)/(2*T) * t^2)
-
-forward(x,t) = forward_sample(x,t,ᾱ)
+forward(x, t) = forward_sample(x, t, ᾱ)
 
 # rotate spatial dims (1,2) by 90° * k
 function rot90_spatial(K, k::Int)
     k = mod(k, 4)
     k == 0 && return K
-    k == 1 && return reverse(permutedims(K, (2,1)), dims=1)
+    k == 1 && return reverse(permutedims(K, (2, 1)), dims=1)
     k == 2 && return reverse(reverse(K, dims=1), dims=2)
-    k == 3 && return reverse(permutedims(K, (2,1)), dims=2)
+    k == 3 && return reverse(permutedims(K, (2, 1)), dims=2)
 end
 
 # reflection (horizontal mirror)
 reflect_spatial(K) = reverse(K, dims=2)
 
-function sinusoidal_embedding(t::Float32, embedding_dim::Int, max_positions::Int=10000)
-    half_dim = embedding_dim ÷ 2
-    emb_scale = log(Float32(max_positions)) / (half_dim - 1)
-    emb = exp.(-emb_scale .* Float32.(0:half_dim-1))
-    emb = t .* emb  # shape: (half_dim,)
-    emb = vcat(sin.(emb), cos.(emb))  # shape: (embedding_dim,)
-    return Float32.(emb)
-end
-
-function load_images(imgs::AbstractArray, t_max, forward,emb_dim)
-    x_dim, y_dim ,num_imgs = size(imgs)
-    x = ones(Float32, x_dim, y_dim, 2+emb_dim, num_imgs)
-    y = zeros(Float32, x_dim,y_dim, 1, num_imgs)
-    t = t_max .* rand(Float32, num_imgs)
-    # Equivariant training data augmentation
-    if x_dim == y_dim
-        for i in 1:num_imgs
-            img = normalize_image(imgs[:,:,i])
-            if rand(Bool)
-                img = reflect_spatial(img)
-            end
-            img = rot90_spatial(img, rand(0:3))
-            xt, ϵ = forward(img, t[i])
-            x[:, :, 1, i] = xt
-            emb = reshape(sinusoidal_embedding(t[i], emb_dim), (1,1,emb_dim,1))
-            x[:, :, 3:end, i] .= emb
-            y[:, :, 1, i] = ϵ
-        end
-    else
-        for i in 1:num_imgs
-            img = normalize_image(imgs[:,:,i])
-            xt, ϵ = forward(img, t[i])
-            x[:, :, 1, i] = xt
-            emb = reshape(sinusoidal_embedding(t[i], emb_dim), (1,1,emb_dim,1))
-            x[:, :, 3:end, i] .= emb
-            y[:, :, 1, i] = ϵ
-        end
-    end
-    return x,y
-end
-
-
 struct NoisyImageDataset
-    imgs::Array{Float32, 3}   # (H, W, N) — raw images on CPU
+    imgs::Array{Float32,3}   # (H, W, N) — raw images on CPU, in [0, 1]
     t_max::Float32
-    emb_dim::Int
 end
 
 Base.length(d::NoisyImageDataset) = size(d.imgs, 3)
 
 function Base.getindex(d::NoisyImageDataset, i::Int)
     img = d.imgs[:, :, i]
-    
-    # Augmentation
+
+    # Equivariant training data augmentation
     if size(img, 1) == size(img, 2)
         rand(Bool) && (img = reflect_spatial(img))
         img = rot90_spatial(img, rand(0:3))
     end
 
-    # Normalize here!
     img = normalize_image(img)
 
     t = d.t_max * rand(Float32)
     xt, ε = forward(img, t)
 
     H, W = size(img)
-    x = ones(Float32, H, W, 2 + d.emb_dim)
-    x[:, :, 1] = xt
-    # channel 2 — fill in whatever you intended here
-    emb = reshape(sinusoidal_embedding(t, d.emb_dim), (1, 1, d.emb_dim))
-    x[:, :, 3:end] .= emb
-
-    y = reshape(ε, H, W, 1)
-    return x, y
+    ximg = reshape(Float32.(xt), H, W, 1)
+    y = reshape(Float32.(ε), H, W, 1)
+    return (ximg, Float32(t)), y
 end
 
-# getindex over a range → stack individual samples
+# getindex over a range → stack individual samples into a batch
 function Base.getindex(d::NoisyImageDataset, idxs::AbstractVector{Int})
     samples = [d[i] for i in idxs]
-    xs = cat([s[1] for s in samples]...; dims=4)
-    ys = cat([s[2] for s in samples]...; dims=4)
-    return xs, ys
+    ximgs = cat((s[1][1] for s in samples)...; dims=4)
+    ts = Float32[s[1][2] for s in samples]
+    ys = cat((s[2] for s in samples)...; dims=4)
+    return (ximgs, ts), ys
 end
 
-function create_dataloader(imgs, T, forward, emb_dim, dev, batch_size)
-    dataset = NoisyImageDataset(imgs, Float32(T), emb_dim)
-    DataLoader(dataset; batchsize=batch_size, shuffle=true, partial=false,collate=true, buffer=false) |> dev
+function create_dataloader(imgs, T, dev, batch_size)
+    dataset = NoisyImageDataset(imgs, Float32(T))
+    DataLoader(dataset; batchsize=batch_size, shuffle=true, partial=false, collate=true, buffer=false) |> dev
 end
-data_args = (imgs, T, forward, emb_dim, dev, batch_size)
+data_args = (imgs, T, dev, batch_size)
 dataloader = create_dataloader(data_args...)
 
-
-
-
-
-
-
-function train_epoch!(dataloader, train_state, epoch_idx::Int, print_intermediate::Bool = false)
+function train_epoch!(dataloader, train_state, epoch_idx::Int, print_intermediate::Bool=false)
     start_time = now()
     println("\n" * "="^50)
     println("🚀 Epoch $epoch_idx Started at: $(Dates.format(start_time, "yyyy-mm-dd HH:MM:SS"))")
@@ -250,10 +153,8 @@ function train_epoch!(dataloader, train_state, epoch_idx::Int, print_intermediat
     num_batches = length(dataloader)
 
     for (i, data) in enumerate(dataloader)
-        # train! edits the training state and returns the current loss
         _, loss, _, train_state = train!(data, train_state)
-        
-        # Move loss to CPU to store/print safely
+
         current_loss = Float32(loss)
         push!(batch_losses, current_loss)
         if print_intermediate
@@ -276,79 +177,77 @@ function train_epoch!(dataloader, train_state, epoch_idx::Int, print_intermediat
     return train_state, batch_losses
 end
 
-epoch = 1
-train_state, losses = train_epoch!(dataloader, train_state, epoch)
+function save_checkpoint(train_state; snapshot::Bool=false, avg_loss=nothing)
+    ps_cpu = train_state.parameters |> cdev
+    st_cpu = train_state.states |> cdev
+    @save "ps_latestvn.jld2" ps_cpu
+    @save "st_latestvn.jld2" st_cpu
+    if snapshot
+        t = now()
+        mkpath("snapshots")
+        @save "snapshots/ps$(avg_loss)_$t.jld2" ps_cpu
+        @save "snapshots/st$(avg_loss)_$t.jld2" st_cpu
+    end
+end
 
-#Plot the batch losses directly to the console
-function plot_epoch(losses,epoch)
+# Plot the batch losses directly to the console
+function plot_epoch(losses, epoch)
     println("📈 Loss Curve (Epoch $epoch):")
     plt = lineplot(
-        losses, 
-        title = "Training Loss", 
-        xlabel = "Batch", 
-        ylabel = "MSE", 
-        border = :dotted,
-        width = 60,
-        height = 15
+        losses,
+        title="Training Loss",
+        xlabel="Batch",
+        ylabel="MSE",
+        border=:dotted,
+        width=60,
+        height=15,
     )
     display(plt)
 end
-plot_epoch(losses,epoch)
-ps_cpu = train_state.parameters |> cdev
-st_cpu = train_state.states |> cdev
-@save "ps_latestvn.jld2" ps_cpu        
-@save "st_latestvn.jld2" st_cpu
 
-using Optimisers: adjust!
-learn_rate = 1.0e-3
-decay = 0.98
+"""
+    train_many_epochs!(train_state, n_epochs; base_lr, decay, warmup_epochs, start_epoch)
 
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
-learn_rate *= decay; train_state = adjust!(train_state, learn_rate); epoch +=1; dataloader = create_dataloader(data_args...);train_state, losses = train_epoch!(dataloader, train_state, epoch)
+Runs `n_epochs` of training: a linear LR warmup from 0 up to `base_lr` over
+the first `warmup_epochs` epochs (a cheap guard against early instability
+whenever the loss landscape is roughest, right after init), then geometric
+decay (`lr *= decay` every epoch) after that. Checkpoints to
+`ps_latestvn.jld2` / `st_latestvn.jld2` (plus a timestamped snapshot) after
+every epoch. Safe to interrupt (e.g. Ctrl-C in the REPL) between epochs and
+re-run — pass `start_epoch` to pick the LR schedule back up where it left off.
+"""
+function train_many_epochs!(
+    train_state, n_epochs::Int;
+    base_lr::Float32=2.0f-4, decay::Float32=0.985f0, warmup_epochs::Int=3, start_epoch::Int=1,
+)
+    epoch = start_epoch
+    for _ in 1:n_epochs
+        learn_rate = if epoch <= warmup_epochs
+            base_lr * epoch / warmup_epochs
+        else
+            base_lr * decay^(epoch - warmup_epochs)
+        end
+        train_state = Optimisers.adjust!(train_state, Float32(learn_rate))
+        train_state, losses = train_epoch!(dataloader, train_state, epoch)
+        plot_epoch(losses, epoch)
+        save_checkpoint(train_state; snapshot=true, avg_loss=mean(losses))
 
+        epoch += 1
+        global dataloader = create_dataloader(data_args...)
+    end
+    return train_state
+end
 
+# --- Suggested training schedule --------------------------------------------
+# LocalScoreNet is small (a handful of 3x3 conv blocks at constant 64x64
+# resolution, no downsampling), so it's cheap per step but has a strictly
+# bounded receptive field — loss alone is a weak proxy for whether it has
+# learned a sensible local texture, so periodically render a few samples with
+# sample.jl (e.g. every ~10 epochs) to actually look at progress.
 
+# Sanity check first — one (gently warmed-up) epoch to confirm the loss is
+# actually going down before committing to the full run:
+#train_state = train_many_epochs!(train_state, 6)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-ps_cpu = train_state.parameters |> cdev
-st_cpu = train_state.states |> cdev
-@save "ps_latestvn.jld2" ps_cpu        
-@save "st_latestvn.jld2" st_cpu
+# Then the rest of the schedule:
+train_state = train_many_epochs!(train_state, 150; start_epoch=1)

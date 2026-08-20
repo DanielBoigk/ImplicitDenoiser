@@ -33,21 +33,16 @@ end
 # reflection (horizontal mirror)
 reflect_spatial(K) = reverse(K, dims=2)
 
-function sinusoidal_embedding(t::Float32, embedding_dim::Int, max_positions::Int=10000)
-    half_dim = embedding_dim ÷ 2
-    emb_scale = log(Float32(max_positions)) / (half_dim - 1)
-    emb = exp.(-emb_scale .* Float32.(0:half_dim-1))
-    emb = t .* emb  # shape: (half_dim,)
-    emb = vcat(sin.(emb), cos.(emb))  # shape: (embedding_dim,)
-    return Float32.(emb)
-end
-
-function load_images_to_array(path, t, num, forward, img_size, emb_size)
-    x = ones(Float32, img_size, img_size, 2+emb_size, num)
+# The model (see model.jl) computes its own sinusoidal embedding of `t`
+# internally and conditions on it via FiLM, so the dataloader only needs to
+# hand over the raw noisy image and the scalar time — no broadcast embedding
+# channels here.
+function load_images_to_array(path, t, num, forward, img_size)
+    x = zeros(Float32, img_size, img_size, 1, num)
     y = zeros(Float32, img_size, img_size, 1, num)
     for i in 1:num
         img = Float32.(load("$path$i.jpg"))
-        
+
         # Equivariant training data augmentation
         if rand(Bool)
             img = reflect_spatial(img)
@@ -58,16 +53,13 @@ function load_images_to_array(path, t, num, forward, img_size, emb_size)
 
         xt, ϵ = forward(img, t[i])
         x[:, :, 1, i] = xt
-        
-        emb = reshape(sinusoidal_embedding(t[i], emb_size), (1,1,emb_size,1))
-        x[:, :, 3:end, i] .= emb
         y[:, :, 1, i] = ϵ
     end
     return x, y
 end
 
-function load_images(batchsize, path, num, forward,img_size,emb_size,dev, tmax=1)
+function load_images(batchsize, path, num, forward, img_size, dev, tmax=1)
     t_array = tmax .* rand(Float32, num)
-    x_img,y_img = load_images_to_array(path,t_array,num, forward, img_size, emb_dim)
-    DataLoader(mapobs(dev, (x_img, y_img)); batchsize=batchsize, shuffle = true)
+    x_img, y_img = load_images_to_array(path, t_array, num, forward, img_size)
+    DataLoader(mapobs(dev, ((x_img, t_array), y_img)); batchsize=batchsize, shuffle = true)
 end

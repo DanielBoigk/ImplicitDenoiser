@@ -52,16 +52,18 @@ if test_model
     # concatenated tensor: images keep their 1 (grayscale) channel, and the
     # per-sample scalar noise level is embedded internally by the U-Net.
     x_trial = randn(Float32, dim, dim, 1, batch_size) |> dev
+    m_trial = ones(Float32, dim, dim, 1, 1) |> dev
     t_trial = rand(Float32, 1, 1, 1, batch_size) |> dev
     y_trial = randn(Float32, dim, dim, 1, batch_size) |> dev
     data_trial = ((x_trial, t_trial), y_trial)
 
-    model_compiled = @compile model((x_trial, t_trial), ps, st)
-    y_pred, st = model_compiled((x_trial, t_trial), ps, st)
+    model_compiled = @compile model((x_trial, m_trial, t_trial), ps, st)
+    y_pred, st = model_compiled((x_trial, m_trial, t_trial), ps, st)
     println("Model successfully compiled!")
     train!(data_trial, train_state)
     println("Train step successfully compiled!")
 end
+
 
 # Hyperparameters for the Variance Preserving (VP) SDE
 const βmin = 0.1
