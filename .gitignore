@@ -14,3 +14,6 @@ Manifest.toml
 *.jpg
 *.png
 *.parquet
+
+!assets/*.png
+!assets/*.jpg
