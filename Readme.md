@@ -36,3 +36,5 @@ From hereon we can try things like:
 - [RED-Diff](https://arxiv.org/pdf/2305.04391)
 - [Diff-PIR](https://arxiv.org/pdf/2305.08995)
 - [Opt-Diff](https://arxiv.org/pdf/2605.11506)
+
+Note: These are more or less toy models to demonstrate methods for reconstructing inverse problems.
